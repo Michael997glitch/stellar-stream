@@ -40,7 +40,7 @@ describe("Assets API Configuration", () => {
   });
 
   it("should respect ALLOWED_ASSETS environment variable override and normalize", async () => {
-    vi.stubEnv("ALLOWED_ASSETS", "yusd, euRo, testCoin ");
+    vi.stubEnv("ALLOWED_ASSETS", "yusd, euRo, testCoin, usdc, euRO, testcoin ");
     
     const { initDb } = await import("./services/db");
     initDb();
@@ -51,8 +51,18 @@ describe("Assets API Configuration", () => {
     const response = await request(app).get("/api/assets");
     
     expect(response.status).toBe(200);
-    expect(response.body.data).toEqual(["YUSD", "EURO", "TESTCOIN"]);
+    expect(response.body.data).toEqual(["EURO", "TESTCOIN", "USDC", "YUSD"]);
   }, 15000);
+
+  it("should not duplicate an asset already in the allowlist", async () => {
+    vi.stubEnv("ALLOWED_ASSETS", "usdc, USDC, xlm, XLM ");
+
+    const { initDb, getAllowedAssets, addAllowedAsset } = await import("./services/db");
+    initDb();
+
+    expect(getAllowedAssets()).toEqual(["USDC", "XLM"]);
+    expect(addAllowedAsset("usdc")).toEqual(["USDC", "XLM"]);
+  });
 
   it("should enforce JWT protection on admin asset endpoints", async () => {
     const { initDb } = await import("./services/db");
