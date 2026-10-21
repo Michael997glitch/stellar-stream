@@ -130,7 +130,22 @@ frozen timestamp, so `claimable` stops growing. `resume_stream` advances both
 intact rather than compressed. Pausing an already-paused (or canceled) stream and
 resuming a live stream are rejected.
 
-### 2.6 Overflow considerations
+### 2.6 Clock rollback / stale retry recovery
+
+The backend normalizes time through a monotonic ceiling in `nowInSeconds()` so a
+system clock step backwards cannot create negative elapsed time, revive a paused
+stream with a negative pause duration, or write an earlier timestamp after a retry.
+This keeps the progress math and persisted state aligned with the latest valid
+clock value, while stale resume attempts are treated as a no-op instead of
+re-opening the same pause window.
+
+The observable boundary behavior remains the same outside that recovery case:
+
+- before `start_time`: `vested = 0`, status is `scheduled`
+- at `start_time`: `vested = 0`, status is still `active`
+- at `end_time`: `vested = total_amount`, status is `completed`
+
+### 2.7 Overflow considerations
 
 `vested_amount` computes `total_amount * elapsed` in `i128` before dividing.
 Extremely large `total_amount` combined with a very long `elapsed` window can, in

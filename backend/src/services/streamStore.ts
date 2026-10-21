@@ -179,6 +179,7 @@ function listLocalStreamIds(): Set<string> {
 
 let rpcServer: rpc.Server | null = null;
 let serverKeypair: Keypair | null = null;
+let maxSeenUnixTime = Number.NEGATIVE_INFINITY;
 
 /**
  * Initializes Soroban RPC connection and database.
@@ -205,7 +206,16 @@ export async function initSoroban() {
 }
 
 export function nowInSeconds(): number {
-  return Math.floor(Date.now() / 1000);
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(now)) {
+    return maxSeenUnixTime === Number.NEGATIVE_INFINITY ? 0 : maxSeenUnixTime;
+  }
+
+  if (now > maxSeenUnixTime) {
+    maxSeenUnixTime = now;
+  }
+
+  return maxSeenUnixTime === Number.NEGATIVE_INFINITY ? now : maxSeenUnixTime;
 }
 
 function round(value: number): number {
@@ -449,8 +459,9 @@ export function calculateProgress(
   stream: StreamRecord,
   at = nowInSeconds(),
 ): StreamProgress {
+  const safeAt = Number.isFinite(at) ? Math.max(0, at) : nowInSeconds();
   const effectiveAt =
-    stream.pausedAt !== undefined ? Math.min(at, stream.pausedAt) : at;
+    stream.pausedAt !== undefined ? Math.min(safeAt, stream.pausedAt) : safeAt;
 
   const elapsed = Math.max(0, Math.max(0, effectiveAt - stream.startAt) - stream.pausedDuration);
   const ratio = stream.durationSeconds <= 0 ? 1 : Math.min(1, elapsed / stream.durationSeconds);
@@ -458,7 +469,7 @@ export function calculateProgress(
   const vestedAmount = stream.totalAmount * ratio;
 
   return {
-    status: computeStatus(stream, at),
+    status: computeStatus(stream, safeAt),
     ratePerSecond: stream.durationSeconds <= 0 ? Infinity : round(stream.totalAmount / stream.durationSeconds),
     elapsedSeconds,
     vestedAmount: round(vestedAmount),
@@ -1204,6 +1215,14 @@ export async function resumeStream(id: string): Promise<StreamRecord> {
   }
 
   const now = nowInSeconds();
+  if (now <= stream.pausedAt) {
+    logger.warn(
+      { streamId: id, now, pausedAt: stream.pausedAt },
+      "paused stream resume ignored because wall clock moved backwards or a stale retry was replayed",
+    );
+    return stream;
+  }
+
   const elapsed = now - stream.pausedAt;
   stream.pausedDuration = (stream.pausedDuration ?? 0) + elapsed;
   stream.durationSeconds += elapsed;
