@@ -98,7 +98,7 @@ export function evaluateAssetAllowlistConfig(
   validAssets: string[];
   signal: AssetAllowlistOutcomeSignal;
 } {
-  const start = context?.startPerf ?? date.now();
+  const start = context?.startPerf ?? Date.now();
   const rawString = typeof rawInput === "string" ? rawInput.trim() : "";
   const allowEmpty = context?.allowEmpty ?? false;
 
@@ -135,7 +135,7 @@ export function evaluateAssetAllowlistConfig(
 
   let outcome: AssetAllowlistOutcome;
   let detail: string;
-  let isNormalEmpty = false;
+  let isNormalEmpty: boolean;
 
   if (rawString.length === 0) {
     if (allowEmpty) {

@@ -494,7 +494,8 @@ export function initDb(): void {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    db = new Database(DB_PATH);
+    const resolvedDbPath = process.env.DB_PATH || DB_PATH;
+    db = new Database(resolvedDbPath);
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
     db.pragma("synchronous = NORMAL");

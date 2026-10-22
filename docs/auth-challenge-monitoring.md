@@ -152,3 +152,27 @@ npx eslint src/services/auth.ts src/services/authChallengeOutcome.ts src/service
 ```
 
 All boundary cases (wrong network, normal empty case, replay attack, expired challenge, secret redaction, and metric counters) are covered.
+
+## Boundary semantics (SSB-2026-161 / #1104)
+
+All three nonce boundary failures surface to the client as **HTTP 401** with
+`code: "UNAUTHORIZED"`. The distinction between them exists for observability
+and for the retry guarantee below.
+
+| Boundary | Store state when seen | Outcome signal | `reason` | Client action |
+|---|---|---|---|---|
+| Expired nonce | record present, `expiresAt < now` | `transient_delay` (1) | `expired_nonce` | request a new challenge |
+| Reused nonce (same account, valid) | record present, `consumed: true` or `expiresAt >= now` | `blocked` (2) | `reused_nonce` | request a new challenge |
+| Cross-account nonce | record present, `accountId` differs | `blocked` (2) | `reused_nonce` | request a new challenge |
+| Wrong-network signature | record present, `consumed: false` | `blocked` (2) | `wrong_network` | fix wallet network, retry **same** nonce |
+| Invalid signature | record present, `consumed: false` | `blocked` (2) | `invalid_signature` | fix signing, retry **same** nonce |
+| Fresh, valid | record absent | insert `{consumed:false}`, verify, flip `consumed:true` | `success` | — |
+
+**Guarantee.** A nonce is flipped to `consumed: true` **only after**
+`WebAuth.verifyChallengeTxSigners` returns at least one signer. A failed
+signature, a wrong-network signature, or a malformed transaction therefore
+never burns the nonce: the legitimate client can retry the same challenge.
+
+**Linkage.** Each nonce record is bound to the `accountId` that requested the
+challenge. Presenting the same nonce under a different account is classified
+as `reused_nonce` (blocked) and does not mutate either account's state.
