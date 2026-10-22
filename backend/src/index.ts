@@ -43,6 +43,17 @@ import { startArchiveJob } from "./services/archiveJob";
 import { startStreamProgressBroadcaster } from "./services/streamProgressBroadcaster";
 import { startWebhookWorker } from "./services/webhookWorker";
 import { startDeadLetterPruningJob } from "./services/webhookDeadLetterPruningJob";
+import { getWebhookOutcomeSignal, refreshWebhookMetrics } from "./services/webhookMonitor";
+import {
+  getSecretsRotationOutcomeSignal,
+  refreshSecretsRotationMetrics,
+  SecretsRotationCredential,
+  SecretsRotationObservation,
+} from "./services/secretsRotationOutcome";
+import {
+  getIndexerOutcomeSignal,
+  refreshIndexerMetrics,
+} from "./services/indexerMonitor";
 import {
   clearDeadLetters,
   getDeadLetters,
@@ -52,6 +63,9 @@ import {
 import {
   archiveOldStreams,
   calculateProgress,
+  compareStreams,
+  MAX_COMPARE_STREAMS,
+  MIN_COMPARE_STREAMS,
   cancelStream,
   createStream,
   getStream,
@@ -115,9 +129,38 @@ const STREAM_HISTORY_MAX_LIMIT = 200;
 
 export const app = express();
 const port = Number(process.env.PORT ?? 3001);
-const ALLOWED_ASSETS = (process.env.ALLOWED_ASSETS || "USDC,XLM")
-  .split(",")
-  .map((asset) => asset.trim().toUpperCase());
+const ASSET_CODE_REGEX = /^[A-Za-z0-9]{1,12}$/;
+
+/**
+ * Parse and validate the ALLOWED_ASSETS environment configuration.
+ *
+ * Boundary semantics (documented, deterministic):
+ * - Each entry is trimmed and upper-cased (mixed-case input is normalized).
+ * - Empty entries (e.g. from trailing commas) are ignored.
+ * - Duplicate entries (case-insensitive, post-normalization) are collapsed.
+ * - The resulting list is de-duplicated and sorted for a stable order.
+ * - If any entry is not 1-12 alphanumeric characters, startup fails with an
+ *   explicit error (invalid configuration on startup) rather than silently
+ *   dropping or accepting it.
+ */
+export function parseAllowedAssetsConfig(raw: string | undefined): string[] {
+  const source = raw === undefined ? "USDC,XLM" : raw;
+  const entries = source
+    .split(",")
+    .map((asset) => asset.trim().toUpperCase())
+    .filter((asset) => asset.length > 0);
+
+  const invalid = entries.filter((asset) => !ASSET_CODE_REGEX.test(asset));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Invalid ALLOWED_ASSETS configuration: ${invalid
+        .map((asset) => JSON.stringify(asset))
+        .join(", ")} must be 1-12 alphanumeric characters.`,
+    );
+  }
+
+  return Array.from(new Set(entries)).sort();
+}
 
 const SORT_FIELDS = ["totalAmount", "startAt", "createdAt", "durationSeconds"] as const;
 const SORT_ORDERS = ["asc", "desc"] as const;
@@ -411,6 +454,22 @@ app.get("/metrics", async (_req: Request, res: Response) => {
     }
   }
 
+  // Publish the coarse webhook health signal alongside the raw counters so
+  // the scrape and GET /api/webhooks/monitoring cannot disagree.
+  try {
+    refreshWebhookMetrics();
+  } catch (error) {
+    logger.warn({ err: error }, "failed to refresh webhook monitoring metrics");
+  }
+
+  // Same contract for the indexer outcome signal and
+  // GET /api/indexer/monitoring.
+  try {
+    refreshIndexerMetrics();
+  } catch (error) {
+    logger.warn({ err: error }, "failed to refresh indexer monitoring metrics");
+  }
+
   const output = await register.metrics();
   res.setHeader("Content-Type", "text/plain; version=0.0.4");
   res.send(output);
@@ -466,9 +525,31 @@ app.get(
   },
 );
 
-app.get("/api/assets", (_req: Request, res: Response) => {
+app.get("/api/assets", (req: Request, res: Response) => {
+  const startPerf = Date.now();
+  // Guarantee a stable, normalized, sorted, de-duplicated list regardless of
+  // insertion order or duplicate rows in the backing store.
+  const assets = Array.from(new Set(getAllowedAssets().map((a) => a.toUpperCase()))).sort();
+  const latencyMs = Math.max(0, Date.now() - startPerf);
+  const isNormalEmpty = assets.length === 0;
+
+  logger.info(
+    {
+      event: "asset_allowlist_query",
+      outcome: "success",
+      outcomeCode: 0,
+      latencyMs,
+      isNormalEmpty,
+      count: assets.length,
+      correlation_id: req.correlationId,
+      requestId: req.requestId,
+      streamId: typeof req.query.streamId === "string" ? req.query.streamId : undefined,
+    },
+    `Asset allowlist queried: ${assets.length} active allowed asset(s)`,
+  );
+
   res.json({
-    data: getAllowedAssets(),
+    data: assets,
   });
 });
 
@@ -485,7 +566,6 @@ app.post("/api/admin/assets", adminJwtAuth, (req: Request, res: Response) => {
     return;
   }
   const cleanCode = code.trim().toUpperCase();
-  const ASSET_CODE_REGEX = /^[A-Za-z0-9]{1,12}$/;
   if (!ASSET_CODE_REGEX.test(cleanCode)) {
     sendApiError(req, res, 400, "Asset code must be 1–12 alphanumeric characters.", { code: "VALIDATION_ERROR" });
     return;
@@ -576,12 +656,17 @@ app.get("/api/streams", readLimiter, async (req: Request, res: Response) => {
   }
   if (query.q && query.q.length > 0) {
     const searchTerm = query.q.toLowerCase();
+    // When an explicit asset filter (asset or assetCode) is already applied,
+    // exclude the assetCode arm from the q search so that q cannot conflict
+    // with the asset constraint. All filters combine with AND logic.
+    const assetAlreadyFiltered =
+      !!query.asset || (!!query.assetCode && query.assetCode.length > 0);
     data = data.filter((stream) => {
       return (
         stream.id.toLowerCase().includes(searchTerm) ||
         stream.sender.toLowerCase().includes(searchTerm) ||
         stream.recipient.toLowerCase().includes(searchTerm) ||
-        stream.assetCode.toLowerCase().includes(searchTerm)
+        (!assetAlreadyFiltered && stream.assetCode.toLowerCase().includes(searchTerm))
       );
     });
   }
@@ -618,35 +703,80 @@ app.get("/api/streams", readLimiter, async (req: Request, res: Response) => {
   res.json(result);
 });
 
+/**
+ * GET /api/streams/search
+ *
+ * Dedicated full-text search endpoint.
+ *
+ * Query parameters
+ * ----------------
+ * q        (required) Non-empty search term.  Case-insensitive substring match
+ *           across stream id, sender, recipient, and assetCode.
+ * asset    (optional) Exact asset-code match (case-insensitive, 1-12 alphanumeric
+ *           characters).  When supplied, results are AND-filtered: only streams
+ *           that match BOTH `q` AND the given asset code are returned.
+ *
+ * Boundary behaviour
+ * ------------------
+ * • Missing or empty `q`              → 400 VALIDATION_ERROR
+ * • `asset` with invalid format       → 400 VALIDATION_ERROR
+ * • Valid `q` that matches nothing    → 200, data:[], total:0
+ * • Valid `q` + `asset` combo         → 200, intersection of both filters
+ */
 app.get("/api/streams/search", readLimiter, (req: Request, res: Response) => {
-  const q = z.string().min(1, "search query must not be empty").safeParse(req.query.q);
-  if (!q.success) {
-    sendValidationError(req, res, q.error.issues);
+  // --- validate q ---
+  const qResult = z.string().min(1, "search query must not be empty").safeParse(req.query.q);
+  if (!qResult.success) {
+    sendValidationError(req, res, qResult.error.issues);
+    return;
+  }
+
+  // --- validate optional asset filter ---
+  const assetResult = z
+    .string()
+    .regex(ASSET_CODE_REGEX, "asset must be 1–12 alphanumeric characters (e.g. USDC, XLM)")
+    .optional()
+    .safeParse(req.query.asset !== undefined ? String(req.query.asset) : undefined);
+  if (!assetResult.success) {
+    sendValidationError(req, res, assetResult.error.issues);
     return;
   }
 
   try {
-    const streamIds = searchStreamsFts(q.data);
     const now = nowInSeconds();
-    const results = streamIds
+    // Step 1: FTS scan — returns matching stream IDs ordered newest-first
+    const streamIds = searchStreamsFts(qResult.data);
+
+    // Step 2: Hydrate stream records and compute progress
+    let results = streamIds
       .map((id) => getStream(id))
-      .filter((s) => s !== null)
+      .filter((s): s is NonNullable<typeof s> => s !== null)
       .map((s) => ({
         ...s,
-        progress: calculateProgress(s!, now),
+        progress: calculateProgress(s, now),
       }));
+
+    // Step 3: AND-filter by asset code (case-insensitive exact match)
+    const assetFilter = assetResult.data?.toUpperCase();
+    if (assetFilter) {
+      results = results.filter(
+        (s) => s.assetCode.toUpperCase() === assetFilter,
+      );
+    }
 
     res.set("Cache-Control", "max-age=5");
     res.json({
       data: results,
       total: results.length,
-      query: q.data,
+      query: qResult.data,
+      ...(assetFilter ? { asset: assetFilter } : {}),
     });
   } catch (err) {
     logger.error({ err }, "search failed");
     sendApiError(req, res, 500, "Search failed.", { code: "SEARCH_ERROR" });
   }
 });
+
 
 app.get("/api/events", readLimiter, (req: Request, res: Response) => {
   const parsedQuery = listEventsQuerySchema.safeParse(req.query);
@@ -883,12 +1013,17 @@ app.get(
     }
     if (query.q && query.q.length > 0) {
       const searchTerm = query.q.toLowerCase();
+      // When an explicit asset filter is already applied, exclude the assetCode
+      // arm from q so that q does not conflict with the asset constraint.
+      // All filters combine with AND logic.
+      const assetAlreadyFiltered =
+        !!query.asset || (!!query.assetCode && query.assetCode.length > 0);
       data = data.filter(
         (stream) =>
           stream.id.toLowerCase().includes(searchTerm) ||
           stream.sender.toLowerCase().includes(searchTerm) ||
           stream.recipient.toLowerCase().includes(searchTerm) ||
-          stream.assetCode.toLowerCase().includes(searchTerm),
+          (!assetAlreadyFiltered && stream.assetCode.toLowerCase().includes(searchTerm)),
       );
     }
     if (query.minAmount !== undefined) {
@@ -912,6 +1047,66 @@ app.get(
     res.json({ data: paginatedData, total, page, limit });
   },
 );
+
+function isDatabaseTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; message?: unknown };
+  const code = typeof candidate.code === "string" ? candidate.code.toUpperCase() : "";
+  const message = typeof candidate.message === "string" ? candidate.message : "";
+  return (
+    code === "SQLITE_BUSY" ||
+    code === "SQLITE_LOCKED" ||
+    code === "ETIMEDOUT" ||
+    code === "QUERY_TIMEOUT" ||
+    code === "DATABASE_TIMEOUT" ||
+    /timeout|timed out|database is locked|sqlite_busy/i.test(message)
+  );
+}
+
+function queryRecipientStreamsWithRetry(
+  recipientAddress: string,
+  sort: "totalAmount" | "startAt" | "createdAt" | "durationSeconds",
+  order: "asc" | "desc",
+): StreamRecord[] {
+  try {
+    return listStreamsByRecipient(recipientAddress, sort, order);
+  } catch (error) {
+    if (isDatabaseTimeoutError(error)) {
+      // Read-only retry on transient database timeout/lock: never duplicates state or events
+      return listStreamsByRecipient(recipientAddress, sort, order);
+    }
+    throw error;
+  }
+}
+
+function sendRecipientStreamsQueryError(
+  req: Request,
+  res: Response,
+  accountId: string,
+  error: unknown,
+) {
+  logger.error({ err: error, accountId }, "failed to query recipient streams");
+  if (isDatabaseTimeoutError(error)) {
+    const normalized = normalizeUnknownApiError(
+      error,
+      "Database query timed out while fetching recipient streams.",
+    );
+    return sendApiError(req, res, 503, normalized.message, {
+      code: "DATABASE_TIMEOUT",
+    });
+  }
+  const normalizedError = normalizeUnknownApiError(
+    error,
+    "Failed to fetch recipient streams.",
+  );
+  return sendApiError(
+    req,
+    res,
+    normalizedError.statusCode,
+    normalizedError.message,
+    { code: normalizedError.code ?? "INTERNAL_ERROR" },
+  );
+}
 
 app.get(
   "/api/streams/recipient/:address",
@@ -935,10 +1130,21 @@ app.get(
     }
     const query = parsedQuery.data;
 
-    const rawStreams = await withAddressCache(
-      `streams:recipient:${address}`,
-      () => listStreamsByRecipient(address, query.sort ?? "createdAt", query.order ?? "desc"),
-    );
+    let rawStreams: StreamRecord[];
+    try {
+      rawStreams = await withAddressCache(
+        `streams:recipient:${address}`,
+        () =>
+          queryRecipientStreamsWithRetry(
+            address,
+            query.sort ?? "createdAt",
+            query.order ?? "desc",
+          ),
+      );
+    } catch (error: unknown) {
+      sendRecipientStreamsQueryError(req, res, address, error);
+      return;
+    }
 
     const now = nowInSeconds();
     let data = rawStreams.map((stream) => ({
@@ -954,6 +1160,12 @@ app.get(
         (stream) => stream.sender.toLowerCase() === query.sender!.toLowerCase(),
       );
     }
+    if (query.recipient) {
+      data = data.filter(
+        (stream) =>
+          stream.recipient.toLowerCase() === query.recipient!.toLowerCase(),
+      );
+    }
     if (query.asset) {
       data = data.filter(
         (stream) =>
@@ -967,12 +1179,17 @@ app.get(
     }
     if (query.q && query.q.length > 0) {
       const searchTerm = query.q.toLowerCase();
+      // When an explicit asset filter is already applied, exclude the assetCode
+      // arm from q so that q does not conflict with the asset constraint.
+      // All filters combine with AND logic.
+      const assetAlreadyFiltered =
+        !!query.asset || (!!query.assetCode && query.assetCode.length > 0);
       data = data.filter(
         (stream) =>
           stream.id.toLowerCase().includes(searchTerm) ||
           stream.sender.toLowerCase().includes(searchTerm) ||
           stream.recipient.toLowerCase().includes(searchTerm) ||
-          stream.assetCode.toLowerCase().includes(searchTerm),
+          (!assetAlreadyFiltered && stream.assetCode.toLowerCase().includes(searchTerm)),
       );
     }
     if (query.minAmount !== undefined) {
@@ -996,6 +1213,62 @@ app.get(
     res.json({ data: paginatedData, total, page, limit });
   },
 );
+
+const compareStreamsQuerySchema = z.object({
+  ids: z
+    .string()
+    .trim()
+    .min(1, "ids must not be empty")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((id) => id.trim())
+        .filter((id) => id.length > 0),
+    )
+    .refine((ids) => ids.length >= MIN_COMPARE_STREAMS, {
+      message: `At least ${MIN_COMPARE_STREAMS} stream IDs are required.`,
+    })
+    .refine((ids) => ids.length <= MAX_COMPARE_STREAMS, {
+      message: `At most ${MAX_COMPARE_STREAMS} stream IDs are allowed.`,
+    }),
+});
+
+app.get("/api/streams/compare", readLimiter, (req: Request, res: Response) => {
+  const parsedQuery = compareStreamsQuerySchema.safeParse(req.query);
+  if (!parsedQuery.success) {
+    sendValidationError(req, res, parsedQuery.error.issues);
+    return;
+  }
+
+  const ids = parsedQuery.data.ids;
+  for (const id of ids) {
+    const parsedId = parseStreamId(id);
+    if (!parsedId.ok) {
+      sendValidationError(req, res, parsedId.issues);
+      return;
+    }
+  }
+
+  const at = nowInSeconds();
+  try {
+    const data = compareStreams(ids, at);
+    // A comparison is a snapshot: never let a shared cache serve stale values.
+    res.set("Cache-Control", "no-store");
+    res.json({ at, data });
+  } catch (error: unknown) {
+    const normalizedError = normalizeUnknownApiError(
+      error,
+      "Failed to compare streams.",
+    );
+    sendApiError(
+      req,
+      res,
+      normalizedError.statusCode,
+      normalizedError.message,
+      { code: normalizedError.code ?? "INTERNAL_ERROR" },
+    );
+  }
+});
 
 app.get("/api/streams/:id", readLimiter, (req: Request, res: Response) => {
   const parsedId = parseStreamId(req.params.id);
@@ -1040,8 +1313,20 @@ app.get(
     }
     const query = parsedQuery.data;
 
+    let rawStreams: StreamRecord[];
+    try {
+      rawStreams = queryRecipientStreamsWithRetry(
+        accountId,
+        query.sort ?? "createdAt",
+        query.order ?? "desc",
+      );
+    } catch (error: unknown) {
+      sendRecipientStreamsQueryError(req, res, accountId, error);
+      return;
+    }
+
     const now = nowInSeconds();
-    let data = listStreamsByRecipient(accountId, query.sort ?? "createdAt", query.order ?? "desc").map((stream) => ({
+    let data = rawStreams.map((stream) => ({
       ...stream,
       progress: calculateProgress(stream, now),
     }));
@@ -1052,6 +1337,12 @@ app.get(
     if (query.sender) {
       data = data.filter(
         (stream) => stream.sender.toLowerCase() === query.sender!.toLowerCase(),
+      );
+    }
+    if (query.recipient) {
+      data = data.filter(
+        (stream) =>
+          stream.recipient.toLowerCase() === query.recipient!.toLowerCase(),
       );
     }
     if (query.asset) {
@@ -1066,12 +1357,17 @@ app.get(
     }
     if (query.q && query.q.length > 0) {
       const searchTerm = query.q.toLowerCase();
+      // When an explicit asset filter is already applied, exclude the assetCode
+      // arm from q so that q does not conflict with the asset constraint.
+      // All filters combine with AND logic.
+      const assetAlreadyFiltered =
+        !!query.asset || (!!query.assetCode && query.assetCode.length > 0);
       data = data.filter((stream) => {
         return (
           stream.id.toLowerCase().includes(searchTerm) ||
           stream.sender.toLowerCase().includes(searchTerm) ||
           stream.recipient.toLowerCase().includes(searchTerm) ||
-          stream.assetCode.toLowerCase().includes(searchTerm)
+          (!assetAlreadyFiltered && stream.assetCode.toLowerCase().includes(searchTerm))
         );
       });
     }
@@ -1147,12 +1443,16 @@ app.get(
     }
     if (query.q && query.q.length > 0) {
       const searchTerm = query.q.toLowerCase();
+      // When an explicit asset filter is already applied, exclude the assetCode
+      // arm from q so that q does not conflict with the asset constraint.
+      // All filters combine with AND logic.
+      const assetAlreadyFiltered = !!query.asset;
       data = data.filter((stream) => {
         return (
           stream.id.toLowerCase().includes(searchTerm) ||
           stream.sender.toLowerCase().includes(searchTerm) ||
           stream.recipient.toLowerCase().includes(searchTerm) ||
-          stream.assetCode.toLowerCase().includes(searchTerm)
+          (!assetAlreadyFiltered && stream.assetCode.toLowerCase().includes(searchTerm))
         );
       });
     }
@@ -1572,9 +1872,21 @@ app.post(
         return;
       }
 
-      const history = await import("./services/eventHistory").then((m) =>
-        m.getStreamHistory(stream.id),
-      );
+      let history: ReturnType<typeof getStreamHistory> = [];
+      try {
+        const eventHistoryModule = await import("./services/eventHistory");
+        try {
+          history = eventHistoryModule.getStreamHistory(stream.id);
+        } catch {
+          history = eventHistoryModule.getStreamHistory(stream.id);
+        }
+      } catch (historyError) {
+        logger.warn(
+          { err: historyError, streamId: stream.id },
+          "history read failed independently after claim commit; returning empty history without rolling back claim",
+        );
+        history = [];
+      }
 
       res.json({
         result: {
@@ -1679,6 +1991,15 @@ app.patch(
   },
 );
 
+function readHistoryWithRetry<T>(operation: () => T): T {
+  try {
+    return operation();
+  } catch {
+    // Read-only retry: safe against duplicating events, money-moving effects, or stored state
+    return operation();
+  }
+}
+
 app.get(
   "/api/streams/:id/history",
   readLimiter,
@@ -1701,13 +2022,36 @@ app.get(
       Math.max(1, parseInt(req.query.pageSize as string) || 20),
       100,
     );
+    const orderParam = req.query.order === "asc" ? "asc" : undefined;
 
-    const total = countStreamEvents(parsedId.value);
-    const offset = (page - 1) * pageSize;
-    const data = getStreamHistory(parsedId.value, pageSize, offset);
-    const hasMore = offset + pageSize < total;
+    try {
+      const total = readHistoryWithRetry(() => countStreamEvents(parsedId.value));
+      const offset = (page - 1) * pageSize;
+      const data = readHistoryWithRetry(() =>
+        orderParam
+          ? getStreamHistory(parsedId.value, pageSize, offset, orderParam)
+          : getStreamHistory(parsedId.value, pageSize, offset),
+      );
+      const hasMore = offset + pageSize < total;
 
-    res.json({ data, total, page, pageSize, hasMore });
+      res.json({ data, total, page, pageSize, hasMore });
+    } catch (error: unknown) {
+      logger.error(
+        { err: error, streamId: parsedId.value },
+        "failed to read stream history",
+      );
+      const normalizedError = normalizeUnknownApiError(
+        error,
+        "Failed to fetch stream history.",
+      );
+      sendApiError(
+        req,
+        res,
+        normalizedError.statusCode,
+        normalizedError.message,
+        { code: normalizedError.code ?? "HISTORY_READ_FAILED" },
+      );
+    }
   },
 );
 
@@ -1727,7 +2071,28 @@ app.get(
       return;
     }
 
-    res.json({ data: getStreamEventSummary(parsedId.value) });
+    try {
+      const summary = readHistoryWithRetry(() =>
+        getStreamEventSummary(parsedId.value),
+      );
+      res.json({ data: summary });
+    } catch (error: unknown) {
+      logger.error(
+        { err: error, streamId: parsedId.value },
+        "failed to read stream history summary",
+      );
+      const normalizedError = normalizeUnknownApiError(
+        error,
+        "Failed to fetch stream history summary.",
+      );
+      sendApiError(
+        req,
+        res,
+        normalizedError.statusCode,
+        normalizedError.message,
+        { code: normalizedError.code ?? "HISTORY_READ_FAILED" },
+      );
+    }
   },
 );
 
@@ -1748,17 +2113,37 @@ app.get(
     }
 
     const progress = calculateProgress(stream);
-    const history = getStreamHistory(parsedId.value, 50, 0, 'asc');
+    try {
+      const history = readHistoryWithRetry(() =>
+        getStreamHistory(parsedId.value, 50, 0, "asc"),
+      );
 
-    res.json({
-      data: {
-        stream: {
-          ...stream,
-          progress,
+      res.json({
+        data: {
+          stream: {
+            ...stream,
+            progress,
+          },
+          history,
         },
-        history,
-      },
-    });
+      });
+    } catch (error: unknown) {
+      logger.error(
+        { err: error, streamId: parsedId.value },
+        "failed to read stream snapshot history",
+      );
+      const normalizedError = normalizeUnknownApiError(
+        error,
+        "Failed to fetch stream history.",
+      );
+      sendApiError(
+        req,
+        res,
+        normalizedError.statusCode,
+        normalizedError.message,
+        { code: normalizedError.code ?? "HISTORY_READ_FAILED" },
+      );
+    }
   },
 );
 
@@ -1783,6 +2168,155 @@ app.get("/api/open-issues", async (req: Request, res: Response) => {
     );
   }
 });
+
+// GET /api/indexer/monitoring — coarse monitoring outcome for the event
+// indexer, focused on RPC rate limiting and disconnection. Ledgers, counts and
+// enumerated state only: it never returns the RPC URL, contract ID, credentials,
+// or a raw provider message.
+app.get(
+  "/api/indexer/monitoring",
+  authMiddleware,
+  (req: Request, res: Response) => {
+    try {
+      const signal = getIndexerOutcomeSignal();
+      res.set("Cache-Control", "no-store");
+      res.json({
+        outcome: signal.outcome,
+        outcomeCode: signal.outcomeCode,
+        detail: signal.detail,
+        state: signal.state,
+      });
+    } catch (error: any) {
+      logger.error({ err: error }, "failed to compute indexer monitoring outcome");
+      const normalizedError = normalizeUnknownApiError(
+        error,
+        "Failed to compute indexer monitoring outcome.",
+      );
+      sendApiError(
+        req,
+        res,
+        normalizedError.statusCode,
+        normalizedError.message,
+        {
+          code: normalizedError.code ?? "INTERNAL_ERROR",
+        },
+      );
+    }
+  },
+);
+
+// GET /api/webhooks/monitoring — coarse delivery-health signal for the
+// outbound webhook pipeline. Counts and state only: it never returns the
+// destination URL, payloads, or stream IDs.
+app.get(
+  "/api/webhooks/monitoring",
+  authMiddleware,
+  (req: Request, res: Response) => {
+    try {
+      const signal = getWebhookOutcomeSignal();
+      res.set("Cache-Control", "no-store");
+      res.json({
+        outcome: signal.outcome,
+        outcomeCode: signal.outcomeCode,
+        detail: signal.detail,
+        isNormalEmpty: signal.isNormalEmpty,
+        latencyMs: signal.latencyMs,
+        counts: signal.counts,
+      });
+    } catch (error: any) {
+      logger.error({ err: error }, "failed to compute webhook monitoring outcome");
+      const normalizedError = normalizeUnknownApiError(
+        error,
+        "Failed to compute webhook monitoring outcome.",
+      );
+      sendApiError(
+        req,
+        res,
+        normalizedError.statusCode,
+        normalizedError.message,
+        {
+          code: normalizedError.code ?? "INTERNAL_ERROR",
+        },
+      );
+    }
+  },
+);
+
+// GET /api/secrets-rotation/monitoring — coarse rollout outcome for the
+// secrets rotation procedure in RUNBOOK.md ("Rotate JWT Secret" /
+// "Rotate Server Signing Key"). Distinguishes success (rotation complete),
+// transient_delay (old-credential artifacts still accepted; expected while
+// outstanding sessions clear) and blocked (fresh artifacts rejected or the
+// restart step was missed). Enumerated state and counts only: it never returns
+// a secret value, a token, a signature, or a raw verification message.
+const SECRETS_ROTATION_CREDENTIALS = [
+  "jwt_secret",
+  "server_signing_key",
+  "both",
+] as const;
+
+app.get(
+  "/api/secrets-rotation/monitoring",
+  authMiddleware,
+  (req: Request, res: Response) => {
+    const credentialParam =
+      typeof req.query.credential === "string" ? req.query.credential : undefined;
+    if (
+      credentialParam !== undefined &&
+      !SECRETS_ROTATION_CREDENTIALS.includes(
+        credentialParam as (typeof SECRETS_ROTATION_CREDENTIALS)[number],
+      )
+    ) {
+      sendApiError(
+        req,
+        res,
+        400,
+        `credential must be one of: ${SECRETS_ROTATION_CREDENTIALS.join(", ")}`,
+        { code: "VALIDATION_ERROR" },
+      );
+      return;
+    }
+    const credential = credentialParam as SecretsRotationCredential | undefined;
+
+    // Live verification probes: the auth middleware accepted this request's
+    // bearer token (fresh not rejected), so stale acceptance is the only
+    // observable the endpoint itself can assert. Fresh-rejection is reported
+    // via ?stale_accepted=true / ?fresh_rejected=true by operators or tests
+    // that have already observed the underlying auth behavior; the endpoint
+    // never verifies credentials itself and never echoes any credential.
+    const staleAccepted = req.query.stale_accepted === "true";
+    const freshRejected = req.query.fresh_rejected === "true";
+    const observation: SecretsRotationObservation = { staleAccepted, freshRejected };
+
+    try {
+      const signal = getSecretsRotationOutcomeSignal(observation, credential);
+      refreshSecretsRotationMetrics(observation, credential);
+      res.set("Cache-Control", "no-store");
+      res.json({
+        outcome: signal.outcome,
+        outcomeCode: signal.outcomeCode,
+        detail: signal.detail,
+        credential: signal.credential,
+        rotationCount: signal.rotationCount,
+      });
+    } catch (error: any) {
+      logger.error({ err: error }, "failed to compute secrets rotation outcome");
+      const normalizedError = normalizeUnknownApiError(
+        error,
+        "Failed to compute secrets rotation outcome.",
+      );
+      sendApiError(
+        req,
+        res,
+        normalizedError.statusCode,
+        normalizedError.message,
+        {
+          code: normalizedError.code ?? "INTERNAL_ERROR",
+        },
+      );
+    }
+  },
+);
 
 app.get(
   "/api/webhooks/dead-letters",
@@ -2005,3 +2539,13 @@ app.delete("/api/streams/:id", adminAuth, (req: Request, res: Response) => {
     );
   }
 });
+
+// Validate the allowlist configuration at module load so that invalid
+// ALLOWED_ASSETS values fail fast on startup with an explicit error instead of
+// silently producing an empty or malformed list.
+try {
+  parseAllowedAssetsConfig(process.env.ALLOWED_ASSETS);
+} catch (error) {
+  logger.error({ err: error }, "invalid ALLOWED_ASSETS configuration");
+  throw error;
+}

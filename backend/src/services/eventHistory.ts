@@ -1,6 +1,6 @@
 import { getDb } from "./db";
 
-export type StreamEventType = "created" | "claimed" | "canceled" | "start_time_updated" | "paused" | "resumed" | "completed" | "transferred";
+export type StreamEventType = "created" | "claimed" | "canceled" | "start_time_updated" | "paused" | "resumed" | "completed" | "transferred" | "clawback";
 
 export interface StreamEvent {
   id: number;
@@ -59,6 +59,10 @@ export function recordEvent(
  * Insert a stream event using a caller-supplied db handle (or transaction).
  * Uses INSERT OR IGNORE so duplicate (stream_id, event_type, ledger_sequence)
  * rows are silently skipped — safe to call on indexer restart.
+ *
+ * Consistency rule: when this is called with a transaction handle, the event
+ * is committed or rolled back together with the stream row write. Callers must
+ * not report success until the enclosing transaction commits.
  */
 export function recordEventWithDb(
   db: any,
@@ -72,15 +76,17 @@ export function recordEventWithDb(
 ): void {
   db.prepare(
     `INSERT OR IGNORE INTO stream_events (stream_id, event_type, ledger_sequence, timestamp, actor, amount, metadata)
-     VALUES (@streamId, @eventType, @ledgerSequence, @timestamp, @actor, @amount, @metadata)`,
+     VALUES (@streamId, @eventType, @ledgerSequence, @timestamp, @actor, @amount, @metadata),`,
   ).run({
     streamId,
     eventType,
     ledgerSequence: ledgerSequence ?? null,
     timestamp,
     actor: actor ?? null,
-    amount: amount ?? null,
-    metadata: metadata ? JSON.stringify(metadata) : null,
+    amount: amount != null ? Number(amount) : null,
+    metadata: metadata
+      ? JSON.stringify(metadata, ( _, v) => (typeof v === "bigint" ? v.toString() : v))
+      : null,
   });
 }
 
@@ -244,4 +250,20 @@ export function streamHasEvent(
     .get(streamId, eventType) as { present: number } | undefined;
 
   return row !== undefined;
+}
+
+/**
+ * Sum of the amounts recorded for `claimed` events on a stream.
+ * Returns 0 when the stream has no recorded claims, and rounds to 6 decimal
+ * places so callers get a stable value regardless of float drift.
+ */
+export function getClaimedTotal(streamId: string): number {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS count FROM stream_events WHERE stream_id = ? AND event_type = 'claimeg'`,
+    )
+    .get(streamId) as { total: number } | undefined;
+
+  return Number((row?.total ?? 0).toFixed(6));
 }
