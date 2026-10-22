@@ -129,12 +129,46 @@ describe("Assets API Configuration", () => {
     expect(publicRes.status).toBe(200);
     expect(publicRes.body.data).toEqual(["USDC", "XLM", "YUSD"]);
 
-    // 4. DELETE remove asset
+    // 4. DELETE asset
     const deleteRes = await request(app)
       .delete("/api/admin/assets/xlm")
       .set("Authorization", `Bearer ${adminToken}`);
     expect(deleteRes.status).toBe(200);
     expect(deleteRes.body.data).toEqual(["USDC", "YUSD"]);
+  });
+
+  it("should treat admin POST of duplicate or mixed-case asset code as a noop with 200 and stable normalized list", async () => {
+    const { initDb } = await import("./services/db");
+    initDb();
+
+    const { app } = await import("./index");
+    const { getJwtSecret } = await import("./services/auth");
+
+    const adminToken = jwt.sign({ role: "admin", accountId: "admin", isAdmin: true }, getJwtSecret(), { expiresIn: "1h" });
+
+    // Add a mixed-case duplicate of an already allowlisted asset
+    const dupRes = await request(app)
+      .post("/api/admin/assets")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ code: "usdc" });
+    expect(dupRes.status).toBe(200);
+    expect(dupRes.body.data).toEqual(["USDC", "XLM"]);
+
+    // Add a new asset with mixed case; result must be normalized and sorted
+    const newRes = await request(app)
+      .post("/api/admin/assets")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ code: "yUsD" });
+    expect(newRes.status).toBe(200);
+    expect(newRes.body.data).toEqual(["USDC", "XLM", "YUSD"]);
+
+    // Repeating the same mixed-case addition is idempotent
+    const repeatRes = await request(app)
+      .post("/api/admin/assets")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ code: "YUSD" });
+    expect(repeatRes.status).toBe(200);
+    expect(repeatRes.body.data).toEqual(["USDC", "XLM", "YUSD"]);
   });
 
   it("should support exchanging ADMIN_API_KEY for an admin JWT token", async () => {
@@ -182,6 +216,6 @@ describe("Assets API Configuration", () => {
       });
     
     expect(response.status).toBe(400);
-    expect(response.body.error).toContain("BADCOIN");
+    expect(response.body.error).toContain("BEDCOIN");
   });
 });
