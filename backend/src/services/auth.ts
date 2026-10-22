@@ -31,13 +31,30 @@ const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE || Networks.TESTNET;
 
 // Replay attack prevention
 const TIMESTAMP_TOLERANCE_SECONDS = 60; // 60 seconds tolerance
-const nonceStore = new Map<string, number>(); // nonce -> expiry timestamp
+
+/**
+ * Nonce lifecycle record.
+ *
+ * A nonce is inserted with `consumed: false` when the challenge is first seen
+ * and flipped to `consumed: true` only after the client signature has been
+ * verified. This guarantees that:
+ *   - an expired nonce can be distinguished from a reused nonce, and
+ *   - a failed signature (or wrong-network signature) never burns a nonce
+ *     that a legitimate client still holds.
+ */
+interface NonceRecord {
+  accountId: string;
+  expiresAt: number;
+  consumed: boolean;
+}
+
+const nonceStore = new Map<string, NonceRecord>();
 
 // Clean up expired nonces every 5 minutes
 setInterval(() => {
   const now = Math.floor(Date.now() / 1000);
-  for (const [nonce, expiry] of nonceStore.entries()) {
-    if (now > expiry) {
+  for (const [nonce, record] of nonceStore.entries()) {
+    if (now > record.expiresAt) {
       nonceStore.delete(nonce);
     }
   }
@@ -201,6 +218,11 @@ export function clearNonceStoreForTesting(): void {
   nonceStore.clear();
 }
 
+/** Test-only helper — returns a snapshot of the nonce store for assertions. */
+export function _getNonceStoreForTesting(): ReadonlyMap<string, NonceRecord> {
+  return nonceStore;
+}
+
 function extractManageDataString(val: unknown): string {
   if (typeof val === "string") return val;
   if (val instanceof Uint8Array || Buffer.isBuffer(val)) {
@@ -289,31 +311,75 @@ export async function verifyChallengeAndIssueToken(
         throw err;
       }
 
-      // Check if nonce has been used before (replay attack)
-      if (nonceStore.has(nonce)) {
-        const latencyMs = Date.now() - startTime;
-        recordAuthChallengeOutcome({
-          outcome: "blocked",
-          outcomeCode: AUTH_CHALLENGE_OUTCOME_CODES.blocked,
-          reason: "reused_nonce",
-          detail: "Challenge nonce has already been used (replay attack detected)",
-          isNormalEmpty: false,
-          latencyMs,
-          accountId: clientAccountID,
-          expectedNetwork: NETWORK_PASSPHRASE,
-          correlation_id: correlationId,
-          streamId,
-        });
-        const err = new Error(
-          "Challenge nonce has already been used (replay attack detected)",
-        );
-        (err as any).outcomeRecorded = true;
-        throw err;
-      }
+      // ── Nonce boundary: expired vs. reused vs. fresh ─────────────────
+      // The store keeps a record for every nonce we have seen. The record
+      // is NOT flipped to consumed:true until the signature verifies below,
+      // so a failed attempt cannot silently burn the nonce.
+      const existing = nonceStore.get(nonce);
+      if (existing) {
+        // Expired record that has not yet been reaped by the cleanup timer.
+        if (now > existing.expiresAt) {
+          const latencyMs = Date.now() - startTime;
+          recordAuthChallengeOutcome({
+            outcome: "transient_delay",
+            outcomeCode: AUTH_CHALLENGE_OUTCOME_CODES.transient_delay,
+            reason: "expired_nonce",
+            detail: "Challenge nonce has expired. Please request a new challenge.",
+            isNormalEmpty: false,
+            latencyMs,
+            accountId: clientAccountID,
+            expectedNetwork: NETWORK_PASSPHRASE,
+            correlation_id: correlationId,
+            streamId,
+          });
+          const err = new Error(
+            "Challenge nonce has expired. Please request a new challenge.",
+          );
+          (err as any).outcomeRecorded = true;
+          (err as any).statusCode = 401;
+          (err as any).code = "UNAUTHORIZED";
+          throw err;
+        }
 
-      // Store nonce with expiry time to prevent replay
-      const expiryTime = now + TIMESTAMP_TOLERANCE_SECONDS;
-      nonceStore.set(nonce, expiryTime);
+        // Already consumed → genuine replay.
+        // Presented under a different account → cross-account reuse.
+        // Not yet consumed, same account → retry after a prior failed
+        // signature attempt; fall through to signature verification.
+        if (existing.consumed || existing.accountId !== clientAccountID) {
+          const latencyMs = Date.now() - startTime;
+          const sameAccount = existing.accountId === clientAccountID;
+          recordAuthChallengeOutcome({
+            outcome: "blocked",
+            outcomeCode: AUTH_CHALLENGE_OUTCOME_CODES.blocked,
+            reason: "reused_nonce",
+            detail: sameAccount
+              ? "Challenge nonce has already been used (replay attack detected)"
+              : "Challenge nonce was issued to a different account",
+            isNormalEmpty: false,
+            latencyMs,
+            accountId: clientAccountID,
+            expectedNetwork: NETWORK_PASSPHRASE,
+            correlation_id: correlationId,
+            streamId,
+          });
+          const err = new Error(
+            sameAccount
+              ? "Challenge nonce has already been used (replay attack detected)"
+              : "Challenge nonce was issued to a different account",
+          );
+          (err as any).outcomeRecorded = true;
+          (err as any).statusCode = 401;
+          (err as any).code = "UNAUTHORIZED";
+          throw err;
+        }
+      } else {
+        // First time we see this nonce → record it as "seen, not yet consumed".
+        nonceStore.set(nonce, {
+          accountId: clientAccountID,
+          expiresAt: now + TIMESTAMP_TOLERANCE_SECONDS,
+          consumed: false,
+        });
+      }
     } else {
       const latencyMs = Date.now() - startTime;
       recordAuthChallengeOutcome({
@@ -445,6 +511,19 @@ export async function verifyChallengeAndIssueToken(
       throw err;
     }
 
+    // ── Consume the nonce now that the signature has verified ─────────
+    // This is the single point where a challenge is irreversibly spent.
+    // If the signature had failed (wrong key, wrong network, garbage sig),
+    // we would have thrown above and left consumed:false in the store,
+    // so the legitimate client can retry with the same nonce.
+    if (nonceOp?.value) {
+      const nonce = extractManageDataString(nonceOp.value);
+      const record = nonceStore.get(nonce);
+      if (record) {
+        record.consumed = true;
+      }
+    }
+
     // Normal empty case: unfunded account (0 signers in Horizon, falling back to single-signer)
     const isNormalEmpty = accountInfo === null;
     const latencyMs = Date.now() - startTime;
@@ -495,6 +574,7 @@ export async function verifyChallengeAndIssueToken(
     }
 
     // Record outcome if not already recorded prior to rethrowing
+    
     if (!error.outcomeRecorded) {
       recordAuthChallengeOutcome({
         outcome: "blocked",
