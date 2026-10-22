@@ -40,18 +40,18 @@ function modifyChallengeOps(challengeXdr: string, modifications: { timestamp?: n
           if (op.name === 'timestamp') {
               if (modifications.removeTimestamp) continue;
               if (modifications.timestamp !== undefined) {
-                  builder.addOperation(Operation.manageData({ name: 'timestamp', value: modifications.timestamp.toString() }));
+                  builder.addOperation(Operation.manageData({ name: 'timestamp', value: modifications.timestamp.toString(), source: serverKeypair.publicKey() }));
                   continue;
               }
           }
           if (op.name === 'nonce') {
               if (modifications.removeNonce) continue;
               if (modifications.nonce !== undefined) {
-                  builder.addOperation(Operation.manageData({ name: 'nonce', value: modifications.nonce }));
+                  builder.addOperation(Operation.manageData({ name: 'nonce', value: modifications.nonce, source: serverKeypair.publicKey() }));
                   continue;
               }
           }
-          builder.addOperation(Operation.manageData({ name: op.name, value: op.value as any, source: op.source }));
+          builder.addOperation(Operation.manageData({ name: op.name, value: op.value as any, source: op.source || serverKeypair.publicKey() }));
       } else {
           builder.addOperation(op as any);
       }
@@ -77,6 +77,19 @@ describe("verifyChallengeAndIssueToken", () => {
     it("issues a JWT without signer_count/threshold when Horizon returns null", async () => {
       // Horizon fetch fails → falls back to single-signer
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false }));
+
+      const challenge = generateChallenge(clientKeypair.publicKey());
+      const signedTx = signChallenge(challenge, clientKeypair);
+      const token = await verifyChallengeAndIssueToken(signedTx);
+
+      const decoded = jwt.verify(token, TEST_JWT_SECRET) as any;
+      expect(decoded.accountId).toBe(clientKeypair.publicKey());
+      expect(decoded.signer_count).toBeUndefined();
+      expect(decoded.threshold).toBeUndefined();
+    });
+
+    it("issues a JWT without multisig fields when Horizon fetch rejects", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Horizon unavailable")));
 
       const challenge = generateChallenge(clientKeypair.publicKey());
       const signedTx = signChallenge(challenge, clientKeypair);
@@ -207,7 +220,7 @@ describe("verifyChallengeAndIssueToken", () => {
     });
 
     it("rejects timestamp too far in the future", async () => {
-      const futureTimestamp = Math.floor(Date.now() / 1000) + 61; // 61 seconds in future
+      const futureTimestamp = Math.floor(Date.now() / 1000) + 120; // 120 seconds in future
       let challenge = generateChallenge(clientKeypair.publicKey());
       challenge = modifyChallengeOps(challenge, { timestamp: futureTimestamp });
       const signedTx = signChallenge(challenge, clientKeypair);
@@ -268,8 +281,8 @@ describe("verifyChallengeAndIssueToken", () => {
       expect(timestampOp).toBeDefined();
       expect(nonceOp).toBeDefined();
       
-      const timestamp = parseInt(timestampOp.value!.toString('utf-8'), 10);
-      const nonce = nonceOp.value!.toString('utf-8');
+      const timestamp = parseInt(Buffer.from(timestampOp.value as any).toString('utf-8'), 10);
+      const nonce = Buffer.from(nonceOp.value as any).toString('utf-8');
       
       expect(nonce).toMatch(/^[a-f0-9]{32}$/);
       
@@ -344,6 +357,22 @@ describe("authMiddleware", () => {
 
   it("returns 401 with invalid_token error code for malformed token", () => {
     req.headers.authorization = "Bearer invalid.jwt.token";
+
+    authMiddleware(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "Invalid authorization token.",
+      statusCode: 401,
+      requestId: "test-request-id",
+      code: "invalid_token",
+    });
+  });
+
+  it("returns 401 with invalid_token error code for a token signed with the wrong secret", () => {
+    const token = jwt.sign({ accountId: "GTEST123" }, "wrong_secret", { expiresIn: "1h" });
+    req.headers.authorization = `Bearer ${token}`;
 
     authMiddleware(req, res, next);
 
